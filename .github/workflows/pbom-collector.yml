@@ -1,0 +1,108 @@
+# PBOM Collector — Required Workflow for BuildGuard-Test-Lab
+#
+# This workflow is referenced by an org-level repository ruleset.
+# It runs automatically on every push (main/master) and PR across
+# all repositories in the organization.
+#
+# Developer impact: ZERO. This workflow:
+#   - Does not check out the developer's source code
+#   - Does not interfere with the developer's build
+#   - Never blocks a merge (continue-on-error: true)
+#   - Adds ~15-20s to the checks list
+
+name: PBOM Collector
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  collect:
+    name: Collect pipeline metadata
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      # ----------------------------------------------------------
+      # 0. Install the PBOM CLI (build from org source)
+      # ----------------------------------------------------------
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: false
+
+      - name: Checkout PBOM CLI
+        uses: actions/checkout@v4
+        with:
+          repository: BuildGuard-Test-Lab/pbom
+          path: _pbom-cli
+
+      - name: Build and install PBOM CLI
+        run: |
+          cd _pbom-cli
+          go build -o /usr/local/bin/pbom ./cmd/pbom
+          chmod +x /usr/local/bin/pbom
+          pbom version
+
+      # ----------------------------------------------------------
+      # 1. Repo filtering — evaluate before generating PBOM
+      # ----------------------------------------------------------
+      - name: Fetch PBOM config
+        id: config
+        run: |
+          STATUS=$(gh api repos/${{ github.repository_owner }}/.github/contents/pbom-config.yml \
+            --jq '.content' 2>/dev/null | base64 -d > /tmp/pbom-config.yml && echo "found" || echo "missing")
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Fetch repo properties
+        id: props
+        if: steps.config.outputs.status == 'found'
+        run: |
+          PROPS=$(gh api repos/${{ github.repository }}/properties/values \
+            --jq '[.[] | {(.property_name): .value}] | add // {}')
+          echo "json=$PROPS" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Check repo filter
+        id: filter
+        if: steps.config.outputs.status == 'found'
+        run: |
+          if pbom filter --config /tmp/pbom-config.yml \
+            --properties '${{ steps.props.outputs.json }}' \
+            --repo '${{ github.repository }}'; then
+            echo "included=true" >> $GITHUB_OUTPUT
+          else
+            echo "included=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ----------------------------------------------------------
+      # 2. Generate the PBOM (source + build identity only)
+      # ----------------------------------------------------------
+      - name: Generate PBOM
+        if: steps.filter.outputs.included == 'true'
+        run: pbom generate -o ${{ runner.temp }}/pbom.json
+
+      - name: Print PBOM summary
+        if: steps.filter.outputs.included == 'true'
+        run: pbom inspect ${{ runner.temp }}/pbom.json
+
+      # ----------------------------------------------------------
+      # 3. Store the PBOM
+      # ----------------------------------------------------------
+      - name: Upload PBOM artifact
+        if: steps.filter.outputs.included == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pbom-${{ github.run_id }}
+          path: ${{ runner.temp }}/pbom.json
+          retention-days: 90
+          if-no-files-found: warn
